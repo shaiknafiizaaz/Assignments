@@ -1,0 +1,9 @@
+Based on datasets: patient, mortality, OutpatientVisit, and DiseaseMap answer the below questions with R.
+
+Are women more likely to die than men in this group of patients?
+Assume people without a date of death in the mortality table are still alive.
+
+Calculate the mortality rate for every year between 2005 and 2018.
+Is it generally increasing or decreasing?
+Assume patients are only at risk of death as of their first visit (in the outpatient visit file).
+Once they have died, they are no longer at risk in subsequent year.
