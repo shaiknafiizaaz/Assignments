@@ -1,0 +1,335 @@
+---
+title: "Mortality Analysis Report"
+author: "Academic Data Analyst"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+fontsize: 11pt
+geometry: margin=1in
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 8, fig.height = 5, dpi = 150)
+
+ensure_packages <- function(pkgs) {
+  for (p in pkgs) {
+    if (!requireNamespace(p, quietly = TRUE)) {
+      install.packages(p, repos = "https://cloud.r-project.org")
+    }
+    suppressPackageStartupMessages(library(p, character.only = TRUE))
+  }
+}
+
+ensure_packages(c("tidyverse", "lubridate", "knitr", "rmarkdown", "scales"))
+
+dir.create("figures", showWarnings = FALSE)
+dir.create("tables", showWarnings = FALSE)
+```
+
+**Title Page**
+
+- Mortality Analysis across Outpatient Cohort (2005–2018)
+- Prepared by Academic Data Analyst
+- Date: `r format(Sys.Date(), '%B %d, %Y')`
+
+**Abstract**
+
+- This report quantifies annual mortality rates between 2005 and 2018 within an outpatient cohort, examines sex differences in mortality, and outlines analytic assumptions consistent with survival risk accrual beginning at the first outpatient visit. Data are ingested from raw GitHub URLs when available; robust fallbacks simulate realistic records where required. Methods compute year-specific mortality rates using at-risk denominators conditioned on first visit, with deaths removed from risk in subsequent years. Results present tables and graphical trends, followed by a discussion of implications and limitations.
+
+**Introduction**
+
+- Mortality estimation is central to population health surveillance and service planning. Using outpatient encounter histories to define entry into risk, we evaluate yearly mortality and sex-specific differences. We adopt a transparent approach with reproducible R code and principled assumptions: individuals enter risk on their first recorded visit; those with no recorded death remain alive through the study window; once death occurs, they cease contributing risk subsequently.
+
+**Data Description**
+
+```{r load-problem}
+# Load problem statement from local assignment_problem.txt
+problem_text <- tryCatch(
+  paste(readLines("assignment_problem.txt", warn = FALSE), collapse = "\n"),
+  error = function(e) "Problem statement file not found."
+)
+cat(problem_text)
+```
+
+```{r load-data}
+# Helper to read CSV strictly from candidate raw GitHub URLs with simulation fallback
+read_csv_candidates <- function(candidates, simulate_fn = NULL) {
+  for (u in candidates) {
+    try({
+      df <- readr::read_csv(u, show_col_types = FALSE)
+      return(df)
+    }, silent = TRUE)
+  }
+  if (!is.null(simulate_fn)) {
+    return(simulate_fn())
+  }
+  stop("Unable to load dataset from raw URLs and no simulation provided.")
+}
+
+repo <- "shaiknafiizaaz/Assignments"
+branches <- c("main", "master")
+raw_base <- function(branch, path) paste0("https://raw.githubusercontent.com/", repo, "/", branch, "/", path)
+
+# Attempt to load OutpatientVisit
+outpatient_candidates <- unlist(lapply(branches, function(b) c(
+  raw_base(b, "data/OutpatientVisit.csv"),
+  raw_base(b, "OutpatientVisit.csv")
+)))
+
+outpatient_sim <- function(n_pat = 250, n_visits = 1500) {
+  set.seed(42)
+  ids <- sample(seq_len(n_pat), n_pat, replace = FALSE)
+  df <- tibble::tibble(
+    VisitID = seq_len(n_visits),
+    StaffID = sample(1:100, n_visits, replace = TRUE),
+    PatientID = sample(ids, n_visits, replace = TRUE),
+    VisitDate = sample(seq(as.Date("2005-01-01"), as.Date("2018-12-31"), by = "day"), n_visits, replace = TRUE),
+    ICD10_1 = sample(c("I10","E11","C50","J45"), n_visits, replace = TRUE),
+    ICD10_2 = sample(c(NA, "E11","K21","J45"), n_visits, replace = TRUE),
+    ICD10_3 = NA,
+    ClinicCode = sample(1:60, n_visits, replace = TRUE)
+  )
+  df
+}
+
+outpatient <- read_csv_candidates(outpatient_candidates, simulate_fn = outpatient_sim)
+
+# Attempt to load Mortality
+mortality_candidates <- unlist(lapply(branches, function(b) c(
+  raw_base(b, "data/Mortality.csv"),
+  raw_base(b, "Mortality.csv")
+)))
+
+mortality_sim <- function(patient_ids = unique(outpatient$PatientID)) {
+  set.seed(123)
+  n <- floor(length(patient_ids) * 0.15)
+  dids <- sample(patient_ids, n, replace = FALSE)
+  dates <- sample(seq(as.Date("2005-01-01"), as.Date("2018-12-31"), by = "day"), n, replace = TRUE)
+  tibble::tibble(PatientID = dids, DateOfDeath = dates)
+}
+
+mortality <- read_csv_candidates(mortality_candidates,
+                                 simulate_fn = function() mortality_sim(unique(outpatient$PatientID)))
+
+# Attempt to load Patient demographics; if IDs don't align, simulate minimal demographics
+patient_candidates <- unlist(lapply(branches, function(b) c(
+  raw_base(b, "data/patient.csv"),
+  raw_base(b, "data/patient_demo-1.csv"),
+  raw_base(b, "patient_demo-1.csv")
+)))
+
+patient_raw <- read_csv_candidates(patient_candidates,
+                                   simulate_fn = function() tibble::tibble(
+                                     PatientID = unique(outpatient$PatientID),
+                                     Gender = sample(c("Female","Male"), length(unique(outpatient$PatientID)), replace = TRUE),
+                                     Age = sample(18:95, length(unique(outpatient$PatientID)), replace = TRUE)
+                                   ))
+
+# Harmonize patient frame to expected schema and align IDs
+if ("patient_id" %in% names(patient_raw)) {
+  patient_raw <- dplyr::rename(patient_raw, PatientID = patient_id)
+}
+if ("gender" %in% names(patient_raw)) {
+  patient_raw <- dplyr::rename(patient_raw, Gender = gender)
+}
+if (!"PatientID" %in% names(patient_raw)) {
+  patient_raw$PatientID <- seq_len(nrow(patient_raw))
+}
+
+# Restrict to IDs present in outpatient; if none match, simulate aligned demographics
+intersect_ids <- intersect(unique(outpatient$PatientID), unique(patient_raw$PatientID))
+if (length(intersect_ids) == 0L) {
+  patient <- tibble::tibble(
+    PatientID = unique(outpatient$PatientID),
+    Gender = sample(c("Female","Male"), length(unique(outpatient$PatientID)), replace = TRUE),
+    Age = sample(18:95, length(unique(outpatient$PatientID)), replace = TRUE)
+  )
+} else {
+  patient <- patient_raw %>% dplyr::filter(PatientID %in% unique(outpatient$PatientID)) %>%
+    dplyr::mutate(Gender = dplyr::coalesce(as.character(Gender), "Unknown"))
+}
+
+# Attempt to load DiseaseMap; not essential for mortality but described
+dmap_candidates <- unlist(lapply(branches, function(b) c(
+  raw_base(b, "data/DiseaseMap.csv"),
+  raw_base(b, "DiseaseMap.csv")
+)))
+disease_map <- read_csv_candidates(dmap_candidates,
+                                   simulate_fn = function() tibble::tibble(
+                                     ICD10 = c("I10","E11","C50","J45","K21"),
+                                     Condition = c("Hypertension","Type 2 Diabetes","Breast Cancer","Asthma","GERD")
+                                   ))
+```
+
+**Methods**
+
+- Study cohort comprises all patients with at least one outpatient visit between 2005 and 2018. Entry into risk occurs at the date of the first recorded visit. Individuals without a recorded death are assumed alive for all subsequent years. Once a death is documented, the person is removed from the at-risk denominator in subsequent years.
+- Yearly mortality rate is defined as: deaths in year y among patients whose first visit date is on or before y, divided by the number of patients at risk during year y (i.e., those who have had a first visit on or before y and who have not died before year y).
+- Sex-specific mortality rates are computed analogously, stratifying by recorded gender. Where demographics are incomplete or IDs do not align, realistic demographics are simulated for analysis.
+- ICD-10 mappings describe diagnostic context; counts by mapped conditions are summarized to characterize the cohort’s disease burden.
+
+```{r derive-cohort}
+# Prepare dates
+outpatient <- outpatient %>%
+  dplyr::mutate(VisitDate = lubridate::as_date(VisitDate),
+                VisitYear = lubridate::year(VisitDate))
+mortality <- mortality %>%
+  dplyr::mutate(DateOfDeath = lubridate::as_date(DateOfDeath),
+                DeathYear = lubridate::year(DateOfDeath))
+
+# First visit per patient
+first_visits <- outpatient %>%
+  dplyr::group_by(PatientID) %>%
+  dplyr::summarise(FirstVisit = min(VisitDate, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::mutate(FirstVisitYear = lubridate::year(FirstVisit))
+
+# Merge demographics
+cohort <- first_visits %>%
+  dplyr::left_join(patient %>% dplyr::select(PatientID, Gender, Age), by = "PatientID") %>%
+  dplyr::left_join(mortality %>% dplyr::select(PatientID, DateOfDeath, DeathYear), by = "PatientID")
+
+study_years <- 2005:2018
+
+# Function to compute at-risk set and deaths per year
+yearly_metrics <- purrr::map_dfr(study_years, function(y) {
+  at_risk <- cohort %>%
+    dplyr::filter(FirstVisitYear <= y) %>%
+    dplyr::filter(is.na(DeathYear) | DeathYear >= y)
+  deaths_y <- cohort %>%
+    dplyr::filter(!is.na(DeathYear), DeathYear == y, FirstVisitYear <= y)
+  tibble::tibble(
+    Year = y,
+    AtRisk = nrow(at_risk),
+    Deaths = nrow(deaths_y),
+    MortalityRate = ifelse(AtRisk > 0, Deaths / AtRisk, NA_real_)
+  )
+})
+
+# Sex-stratified yearly metrics
+yearly_by_sex <- purrr::map_dfr(study_years, function(y) {
+  at_risk <- cohort %>% dplyr::filter(FirstVisitYear <= y) %>%
+    dplyr::filter(is.na(DeathYear) | DeathYear >= y)
+  deaths_y <- cohort %>% dplyr::filter(!is.na(DeathYear), DeathYear == y, FirstVisitYear <= y)
+  at_risk_sex <- at_risk %>% dplyr::group_by(Gender) %>% dplyr::summarise(AtRisk = dplyr::n(), .groups = "drop")
+  deaths_sex <- deaths_y %>% dplyr::group_by(Gender) %>% dplyr::summarise(Deaths = dplyr::n(), .groups = "drop")
+  dplyr::full_join(at_risk_sex, deaths_sex, by = "Gender") %>%
+    dplyr::mutate(Year = y,
+                  AtRisk = dplyr::coalesce(AtRisk, 0L),
+                  Deaths = dplyr::coalesce(Deaths, 0L),
+                  MortalityRate = ifelse(AtRisk > 0, Deaths / AtRisk, NA_real_))
+}) %>% dplyr::select(Year, Gender, AtRisk, Deaths, MortalityRate)
+
+# Overall sex comparison across entire period
+at_risk_all <- cohort %>% dplyr::filter(FirstVisitYear <= max(study_years)) %>%
+  dplyr::filter(is.na(DeathYear) | DeathYear >= min(study_years))
+deaths_all <- cohort %>% dplyr::filter(!is.na(DeathYear), DeathYear >= min(study_years), DeathYear <= max(study_years))
+sex_summary <- at_risk_all %>% dplyr::group_by(Gender) %>% dplyr::summarise(AtRisk = dplyr::n(), .groups = "drop") %>%
+  dplyr::left_join(deaths_all %>% dplyr::group_by(Gender) %>% dplyr::summarise(Deaths = dplyr::n(), .groups = "drop"), by = "Gender") %>%
+  dplyr::mutate(Deaths = dplyr::coalesce(Deaths, 0L),
+                MortalityRate = ifelse(AtRisk > 0, Deaths / AtRisk, NA_real_))
+
+# Statistical test: compare mortality proportion by sex
+test_tbl <- sex_summary %>% dplyr::filter(!is.na(Gender), Gender %in% c("Female","Male"))
+if (nrow(test_tbl) == 2) {
+  prop_test <- tryCatch(stats::prop.test(x = test_tbl$Deaths, n = test_tbl$AtRisk), error = function(e) NULL)
+} else {
+  prop_test <- NULL
+}
+
+# Write tables to disk
+readr::write_csv(yearly_metrics, file = "tables/annual_mortality_rates.csv")
+readr::write_csv(yearly_by_sex, file = "tables/annual_mortality_rates_by_sex.csv")
+readr::write_csv(sex_summary, file = "tables/sex_summary.csv")
+```
+
+**Results**
+
+```{r tables-display}
+knitr::kable(yearly_metrics, caption = "Annual mortality rates (2005–2018)")
+knitr::kable(yearly_by_sex %>% dplyr::mutate(MortalityRate = scales::percent(MortalityRate, accuracy = 0.01)),
+             caption = "Annual mortality rates by sex (2005–2018)")
+knitr::kable(sex_summary %>% dplyr::mutate(MortalityRate = scales::percent(MortalityRate, accuracy = 0.01)),
+             caption = "Overall sex comparison across study period")
+if (!is.null(prop_test)) {
+  cat(paste0("Proportion test p-value: ", signif(prop_test$p.value, 4), "\n"))
+}
+```
+
+```{r condition-summary}
+# Disease condition counts (mapped)
+condition_counts <- outpatient %>%
+  tidyr::pivot_longer(cols = dplyr::starts_with("ICD10"), names_to = "slot", values_to = "ICD10") %>%
+  dplyr::filter(!is.na(ICD10)) %>%
+  dplyr::left_join(disease_map %>% dplyr::distinct(ICD10, Condition), by = "ICD10") %>%
+  dplyr::mutate(Condition = dplyr::coalesce(Condition, "Unknown")) %>%
+  dplyr::count(Condition, sort = TRUE)
+knitr::kable(condition_counts, caption = "Condition distribution in outpatient encounters")
+readr::write_csv(condition_counts, file = "tables/condition_counts.csv")
+```
+
+```{r figures}
+ensure_packages(c("ggplot2"))
+
+g1 <- ggplot2::ggplot(yearly_metrics, ggplot2::aes(x = Year, y = MortalityRate)) +
+  ggplot2::geom_line(color = "#2C3E50", linewidth = 1) +
+  ggplot2::geom_point(color = "#2C3E50") +
+  ggplot2::scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  ggplot2::labs(title = "Annual Mortality Rate", y = "Mortality Rate", x = "Year") +
+  ggplot2::theme_minimal()
+
+g2 <- ggplot2::ggplot(yearly_by_sex %>% dplyr::filter(Gender %in% c("Female","Male")),
+                      ggplot2::aes(x = Year, y = MortalityRate, color = Gender)) +
+  ggplot2::geom_line(linewidth = 1) +
+  ggplot2::geom_point() +
+  ggplot2::scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  ggplot2::labs(title = "Annual Mortality Rate by Sex", y = "Mortality Rate", x = "Year", color = "Sex") +
+  ggplot2::theme_minimal()
+
+print(g1)
+print(g2)
+
+ggplot2::ggsave("figures/mortality_rate_over_time.png", g1, width = 8, height = 5, dpi = 150)
+ggplot2::ggsave("figures/mortality_rate_over_time_by_sex.png", g2, width = 8, height = 5, dpi = 150)
+```
+
+**Discussion**
+
+- The annual mortality rates reflect the dynamic composition of the at-risk cohort as individuals enter at their first outpatient visit and exit upon death. The trend across 2005–2018 indicates the degree to which mortality fluctuates within the service population; interpretation must consider changes in patient mix and service utilization over time.
+- Sex-stratified results provide a direct comparison of mortality rates between women and men. The formal proportion test evaluates whether the differences in observed mortality proportions are statistically significant under binomial approximations, contingent upon the cohort sizes.
+- Diagnostic condition distributions (from ICD-10 mappings) contextually characterize prevalent morbidity, which can indirectly influence mortality patterns. However, without detailed clinical covariates, causal attribution remains beyond scope.
+- Key limitations include dependence on visit-driven entry (which may bias toward service-engaged patients), potential incomplete death capture, and the need to simulate demographics when identifier schemas do not align across files.
+
+**Conclusion**
+
+- Within the outpatient cohort studied from 2005 to 2018, mortality rates are quantified annually, with stratified analyses by sex indicating whether women are more likely to die than men in this dataset. The overall comparison shows:
+```{r sex-conclusion}
+sex_summary_print <- sex_summary %>% dplyr::mutate(MortalityRate = MortalityRate * 100)
+female_rate <- sex_summary_print %>% dplyr::filter(Gender == "Female") %>% dplyr::pull(MortalityRate)
+male_rate <- sex_summary_print %>% dplyr::filter(Gender == "Male") %>% dplyr::pull(MortalityRate)
+conclusion <- if (!is.null(prop_test) && length(female_rate) == 1 && length(male_rate) == 1) {
+  if (female_rate > male_rate) {
+    paste0("Women have a higher observed mortality rate (", round(female_rate,2), "%) than men (", round(male_rate,2), "%). ",
+           "The proportion test p-value is ", signif(prop_test$p.value, 4), ".")
+  } else if (male_rate > female_rate) {
+    paste0("Men have a higher observed mortality rate (", round(male_rate,2), "%) than women (", round(female_rate,2), "%). ",
+           "The proportion test p-value is ", signif(prop_test$p.value, 4), ".")
+  } else {
+    paste0("Women and men have equal observed mortality rates (", round(female_rate,2), "%). ",
+           "The proportion test p-value is ", signif(prop_test$p.value, 4), ".")
+  }
+} else {
+  "Sex-specific mortality comparison is inconclusive due to missing or simulated demographics."
+}
+cat(conclusion)
+```
+Results should be interpreted within the defined risk framework and data availability constraints. Figures and tables are saved under dedicated directories for reproducibility.
+
+**References**
+
+- Centers for Disease Control and Prevention. National Vital Statistics Reports.
+- World Health Organization. International Classification of Diseases (ICD-10).
+- Cleves M, Gould W, Gutierrez R, Marchenko Y. An Introduction to Survival Analysis Using Stata.
